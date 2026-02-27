@@ -1,0 +1,207 @@
+blueprint:
+  name: License Plate AI Capture + Match Actions (Day/Night Optimized)
+  description: >
+    Capture multiple camera snapshots, use AI Task to extract a license plate,
+    store it in an input_text, and run actions if it matches a known list.
+    Snapshot timing automatically adapts to day/night using sun.sun.
+  domain: automation
+
+  input:
+    camera_device:
+      name: Camera
+      selector:
+        entity:
+          domain: camera
+
+    trigger_sensor:
+      name: Trigger binary sensor(s)
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: true
+
+    condition_auto:
+      name: Conditions to run
+      default: []
+      selector:
+        condition: {}
+
+    num_snapshots:
+      name: Number of snapshots
+      selector:
+        number:
+          min: 1
+          max: 5
+          step: 1
+      default: 3
+
+    snapshot_delay_day_ms:
+      name: Snapshot delay – Day (ms)
+      selector:
+        number:
+          min: 100
+          max: 3000
+          step: 100
+          unit_of_measurement: ms
+      default: 400
+
+    snapshot_delay_night_ms:
+      name: Snapshot delay – Night (ms)
+      selector:
+        number:
+          min: 200
+          max: 5000
+          step: 100
+          unit_of_measurement: ms
+      default: 1200
+
+    cooldown_minutes:
+      name: Cooldown (minutes)
+      selector:
+        number:
+          min: 0
+          max: 10
+          step: 1
+      default: 2
+
+    ai_task_entity:
+      name: AI Task entity
+      selector:
+        entity:
+          domain: ai_task
+
+    ai_prompt:
+      name: AI Prompt
+      selector:
+        text:
+          multiline: true
+      default: >-
+        You are given multiple sequential camera snapshots.
+        Extract the vehicle license plate number if clearly visible.
+        Return ONLY the license plate text (letters/numbers).
+        If not readable, return UNKNOWN.
+
+    plate_storage:
+      name: Plate storage (input_text)
+      selector:
+        entity:
+          domain: input_text
+
+    known_plates:
+      name: Known plates list
+      description: Comma or newline separated list of known plates
+      selector:
+        text:
+          multiline: true
+      default: ""
+
+    on_match_actions:
+      name: Actions when plate matches
+      default: []
+      selector:
+        action: {}
+
+    on_no_match_actions:
+      name: Actions when plate does not match
+      default: []
+      selector:
+        action: {}
+
+trigger:
+  - platform: state
+    entity_id: !input trigger_sensor
+    to: "on"
+
+variables:
+  # Inputs resolved to variables (IMPORTANT)
+  camera_device: !input camera_device
+  num_snapshots: !input num_snapshots
+  cooldown_minutes: !input cooldown_minutes
+  snapshot_delay_day_ms: !input snapshot_delay_day_ms
+  snapshot_delay_night_ms: !input snapshot_delay_night_ms
+  ai_task_entity: !input ai_task_entity
+  ai_prompt: !input ai_prompt
+  plate_storage: !input plate_storage
+  known_plates: !input known_plates
+
+  # Derived values
+  camera_name: "{{ state_attr(camera_device, 'friendly_name') }}"
+  camera_path: "{{ camera_name | lower | replace(' ', '_') }}"
+
+  # ✅ Day / Night snapshot timing (FIXED – no !input in Jinja)
+  snapshot_delay_ms: >-
+    {% if states('sun.sun') == 'above_horizon' %}
+      {{ snapshot_delay_day_ms }}
+    {% else %}
+      {{ snapshot_delay_night_ms }}
+    {% endif %}
+
+action:
+  - if:
+      - condition: !input condition_auto
+    then:
+      # 1️⃣ Capture snapshots
+      - repeat:
+          count: "{{ num_snapshots }}"
+          sequence:
+            - service: camera.snapshot
+              target:
+                entity_id: "{{ camera_device }}"
+              data:
+                filename: "/media/snapshots/{{ camera_path }}_lp_{{ repeat.index }}.jpg"
+            - delay:
+                milliseconds: "{{ snapshot_delay_ms | int }}"
+
+      # Small buffer to ensure files are available
+      - delay: "00:00:02"
+
+      # 2️⃣ AI Task – extract license plate
+      - service: ai_task.generate_data
+        data:
+          entity_id: "{{ ai_task_entity }}"
+          task_name: license_plate_extraction
+          instructions: "{{ ai_prompt }}"
+          structure:
+            plate:
+              description: License plate text or UNKNOWN
+              selector:
+                text: {}
+          attachments: >-
+            {% set ns = namespace(images=[]) %}
+            {% for i in range(1, num_snapshots + 1) %}
+              {% set p = "media-source://media_source/local/snapshots/" ~ camera_path ~ "_lp_" ~ i ~ ".jpg" %}
+              {% set ns.images = ns.images + [{"media_content_id": p, "media_content_type": "image/jpeg"}] %}
+            {% endfor %}
+            {{ ns.images }}
+        response_variable: lp_result
+
+      # 3️⃣ Normalize and store plate
+      - variables:
+          plate_norm: >-
+            {{ lp_result.data.plate | default('UNKNOWN') | upper | replace(' ', '') | replace('-', '') }}
+
+      - service: input_text.set_value
+        target:
+          entity_id: "{{ plate_storage }}"
+        data:
+          value: "{{ plate_norm }}"
+
+      # 4️⃣ Compare and trigger actions
+      - choose:
+          - conditions:
+              - condition: template
+                value_template: >-
+                  {% set list = known_plates | upper | replace(' ', '') | replace('-', '') %}
+                  {{ plate_norm not in ['UNKNOWN',''] and plate_norm in list.replace('\n', ',').split(',') }}
+            sequence:
+              - choose: []
+                default: !input on_match_actions
+        default:
+          - choose: []
+            default: !input on_no_match_actions
+
+      # 5️⃣ Cooldown
+      - delay:
+          seconds: "{{ cooldown_minutes | int * 60 }}"
+
+mode: single

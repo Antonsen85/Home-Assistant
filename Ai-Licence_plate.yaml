@@ -1,9 +1,14 @@
 blueprint:
-  name: License Plate AI Capture + Match Actions (Day/Night Optimized)
+  name: License Plate AI Capture + Match Actions 
   description: >
     Capture multiple camera snapshots, use AI Task to extract a license plate,
     store it in an input_text, and run actions if it matches a known list.
     Snapshot timing automatically adapts to day/night using sun.sun.
+
+    Improvements:
+    - AI returns up to 3 candidates (best first) from all snapshots.
+    - Matching supports fuzzy compare: allow N mismatching characters (default 1).
+    - Plate length is enforced (default 7) to reduce false positives.
   domain: automation
 
   input:
@@ -77,8 +82,13 @@ blueprint:
           multiline: true
       default: >-
         You are given multiple sequential camera snapshots.
-        Extract the vehicle license plate number if clearly visible.
-        Return ONLY the license plate text (letters/numbers).
+        Choose the clearest image(s) and extract the vehicle license plate.
+
+        Return EITHER:
+        - ONE best plate, or
+        - up to THREE candidates separated by commas (best first)
+
+        Use ONLY letters/numbers in each plate (no spaces or hyphens).
         If not readable, return UNKNOWN.
 
     plate_storage:
@@ -94,6 +104,26 @@ blueprint:
         text:
           multiline: true
       default: ""
+
+    expected_plate_length:
+      name: Expected plate length
+      description: Typical DK plates are 7 characters. Used to reduce false positives.
+      selector:
+        number:
+          min: 4
+          max: 10
+          step: 1
+      default: 7
+
+    allowed_mismatches:
+      name: Allowed mismatches (characters)
+      description: How many characters may differ and still count as a match.
+      selector:
+        number:
+          min: 0
+          max: 3
+          step: 1
+      default: 1
 
     on_match_actions:
       name: Actions when plate matches
@@ -112,23 +142,24 @@ trigger:
     entity_id: !input trigger_sensor
     to: "on"
 
+condition: !input condition_auto
+
 variables:
-  # Inputs resolved to variables (IMPORTANT)
+  # Inputs exposed for templating
   camera_device: !input camera_device
   num_snapshots: !input num_snapshots
   cooldown_minutes: !input cooldown_minutes
   snapshot_delay_day_ms: !input snapshot_delay_day_ms
   snapshot_delay_night_ms: !input snapshot_delay_night_ms
-  ai_task_entity: !input ai_task_entity
   ai_prompt: !input ai_prompt
-  plate_storage: !input plate_storage
   known_plates: !input known_plates
+  expected_plate_length: !input expected_plate_length
+  allowed_mismatches: !input allowed_mismatches
 
-  # Derived values
-  camera_name: "{{ state_attr(camera_device, 'friendly_name') }}"
-  camera_path: "{{ camera_name | lower | replace(' ', '_') }}"
+  # Derived
+  camera_name: "{{ state_attr(camera_device, 'friendly_name') or camera_device }}"
+  camera_path: "{{ camera_name | lower | replace(' ', '_') | replace('.', '_') }}"
 
-  # ✅ Day / Night snapshot timing (FIXED – no !input in Jinja)
   snapshot_delay_ms: >-
     {% if states('sun.sun') == 'above_horizon' %}
       {{ snapshot_delay_day_ms }}
@@ -136,72 +167,129 @@ variables:
       {{ snapshot_delay_night_ms }}
     {% endif %}
 
+  # Known plates list -> list of strings (no split filter; use Python .split)
+  known_list: >-
+    {% set s = (known_plates
+      | upper
+      | replace(' ', '')
+      | replace('-', '')
+      | replace('\r', '')
+      | replace('\n', ',')
+    ) %}
+    {% set ns = namespace(out=[]) %}
+    {% for x in s.split(',') %}
+      {% set y = x.strip() %}
+      {% if y != '' %}
+        {% set ns.out = ns.out + [y] %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.out }}
+
 action:
-  - if:
-      - condition: !input condition_auto
-    then:
-      # 1️⃣ Capture snapshots
-      - repeat:
-          count: "{{ num_snapshots }}"
-          sequence:
-            - service: camera.snapshot
-              target:
-                entity_id: "{{ camera_device }}"
-              data:
-                filename: "/media/snapshots/{{ camera_path }}_lp_{{ repeat.index }}.jpg"
-            - delay:
-                milliseconds: "{{ snapshot_delay_ms | int }}"
+  # 1️⃣ Capture snapshots
+  - repeat:
+      count: "{{ num_snapshots }}"
+      sequence:
+        - service: camera.snapshot
+          target:
+            entity_id: !input camera_device
+          data:
+            filename: "/media/snapshots/{{ camera_path }}_lp_{{ repeat.index }}.jpg"
+        - delay:
+            milliseconds: "{{ snapshot_delay_ms | int }}"
 
-      # Small buffer to ensure files are available
-      - delay: "00:00:02"
+  - delay: "00:00:02"
 
-      # 2️⃣ AI Task – extract license plate
-      - service: ai_task.generate_data
-        data:
-          entity_id: "{{ ai_task_entity }}"
-          task_name: license_plate_extraction
-          instructions: "{{ ai_prompt }}"
-          structure:
-            plate:
-              description: License plate text or UNKNOWN
-              selector:
-                text: {}
-          attachments: >-
-            {% set ns = namespace(images=[]) %}
-            {% for i in range(1, num_snapshots + 1) %}
-              {% set p = "media-source://media_source/local/snapshots/" ~ camera_path ~ "_lp_" ~ i ~ ".jpg" %}
-              {% set ns.images = ns.images + [{"media_content_id": p, "media_content_type": "image/jpeg"}] %}
-            {% endfor %}
-            {{ ns.images }}
-        response_variable: lp_result
+  # 2️⃣ AI Task – extract license plate (IMPORTANT: entity_id must be in data)
+  - service: ai_task.generate_data
+    data:
+      entity_id: !input ai_task_entity
+      task_name: license_plate_extraction
+      instructions: "{{ ai_prompt }}"
+      structure:
+        plate:
+          description: License plate text (or up to 3 comma-separated candidates) or UNKNOWN
+          selector:
+            text: {}
+      attachments: >-
+        {% set ns = namespace(images=[]) %}
+        {% for i in range(1, num_snapshots + 1) %}
+          {% set p = "media-source://media_source/local/snapshots/" ~ camera_path ~ "_lp_" ~ i ~ ".jpg" %}
+          {% set ns.images = ns.images + [{"media_content_id": p, "media_content_type": "image/jpeg"}] %}
+        {% endfor %}
+        {{ ns.images }}
+    response_variable: lp_result
 
-      # 3️⃣ Normalize and store plate
-      - variables:
-          plate_norm: >-
-            {{ lp_result.data.plate | default('UNKNOWN') | upper | replace(' ', '') | replace('-', '') }}
+  # 3️⃣ Normalize candidates and store best
+  - variables:
+      plate_candidates: >-
+        {% set raw = lp_result.data.plate | default('UNKNOWN') %}
+        {% set cleaned = (raw | upper | replace(' ', '') | replace('-', '') | replace('\r', '')) %}
+        {% set s = cleaned.replace('\n', ',').replace(';', ',') %}
+        {% set ns = namespace(out=[]) %}
+        {% for x in s.split(',') %}
+          {% set y = x.strip() %}
+          {% if y != '' %}
+            {% set ns.out = ns.out + [y] %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.out }}
 
-      - service: input_text.set_value
-        target:
-          entity_id: "{{ plate_storage }}"
-        data:
-          value: "{{ plate_norm }}"
+      plate_norm: >-
+        {% set ns = namespace(best='UNKNOWN') %}
+        {% set L = expected_plate_length | int %}
+        {% for a in plate_candidates %}
+          {% if a not in ['UNKNOWN',''] and (a | length) == L %}
+            {% set ns.best = a %}
+            {% break %}
+          {% endif %}
+        {% endfor %}
+        {{ ns.best }}
 
-      # 4️⃣ Compare and trigger actions
-      - choose:
-          - conditions:
-              - condition: template
-                value_template: >-
-                  {% set list = known_plates | upper | replace(' ', '') | replace('-', '') %}
-                  {{ plate_norm not in ['UNKNOWN',''] and plate_norm in list.replace('\n', ',').split(',') }}
-            sequence:
-              - choose: []
-                default: !input on_match_actions
-        default:
-          - choose: []
-            default: !input on_no_match_actions
+  - service: input_text.set_value
+    target:
+      entity_id: !input plate_storage
+    data:
+      value: "{{ plate_norm }}"
 
-      # 5️⃣ Cooldown
-      - delay:
-          seconds: "{{ cooldown_minutes | int * 60 }}"
+  # 4️⃣ Fuzzy compare and trigger actions
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: >-
+              {% set allow = allowed_mismatches | int %}
+              {% set L = expected_plate_length | int %}
+              {% set ok = namespace(found=false) %}
+
+              {% for a in plate_candidates %}
+                {% if a not in ['UNKNOWN',''] and (a|length) == L %}
+                  {% for b in known_list %}
+                    {% if (b|length) == L %}
+                      {% set ns = namespace(mis=0) %}
+                      {% for i in range(L) %}
+                        {% if a[i] != b[i] %}
+                          {% set ns.mis = ns.mis + 1 %}
+                          {% if ns.mis > allow %}
+                            {% break %}
+                          {% endif %}
+                        {% endif %}
+                      {% endfor %}
+                      {% if ns.mis <= allow %}
+                        {% set ok.found = true %}
+                        {% break %}
+                      {% endif %}
+                    {% endif %}
+                  {% endfor %}
+                {% endif %}
+                {% if ok.found %}{% break %}{% endif %}
+              {% endfor %}
+
+              {{ ok.found }}
+        sequence: !input on_match_actions
+    default: !input on_no_match_actions
+
+  # 5️⃣ Cooldown
+  - delay:
+      seconds: "{{ (cooldown_minutes | int) * 60 }}"
 
 mode: single
